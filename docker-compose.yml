@@ -1,0 +1,109 @@
+services:
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    container_name: zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+    ports:
+      - "2181:2181"
+
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: kafka
+    depends_on:
+      - zookeeper
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENERS: PLAINTEXT://:9092,PLAINTEXT_INTERNAL://:29092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092,PLAINTEXT_INTERNAL://kafka:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_INTERNAL:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT_INTERNAL
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+
+  postgres:
+    image: postgres:16
+    container_name: postgres
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: 123456
+      POSTGRES_DB: postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./sql:/docker-entrypoint-initdb.d
+
+  spark:
+    image: apache/spark:3.5.1
+    container_name: spark
+    ports:
+      - "8080:8080"
+      - "7077:7077"
+    environment:
+      - SPARK_MODE=master
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.master.Master
+  # --- 新增這個 Worker 服務 ---
+  spark-worker:
+    image: apache/spark:3.5.1
+    container_name: spark-worker
+    depends_on:
+      - spark
+    environment:
+      - SPARK_MODE=worker
+      - SPARK_MASTER_URL=spark://spark:7077
+      - SPARK_WORKER_MEMORY=2G  # 根據你電腦記憶體大小調整
+      - SPARK_WORKER_CORES=2    # 根據你電腦 CPU 核心數調整
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.worker.Worker spark://spark:7077
+  producer:
+    # 改用完整版 Python
+    image: python:3.11
+    container_name: btc-producer
+    depends_on:
+      - kafka
+    working_dir: /app
+    volumes:
+      - ./producer:/app
+    command: >
+      sh -c "
+      pip install kafka-python websocket-client requests &&
+      python binance_trade_producer.py
+      "
+    restart: always
+
+  spark-job:
+    image: apache/spark:3.5.1
+    container_name: spark-streaming
+    user: root
+    depends_on:
+      - kafka
+      - postgres
+      - spark
+    volumes:
+      - ./spark:/opt/spark/work-dir
+    working_dir: /opt/spark/work-dir
+    command: >
+      /opt/spark/bin/spark-submit
+      --conf "spark.driver.extraJavaOptions=-Divy.home=/tmp/.ivy2"
+      --conf "spark.executor.extraJavaOptions=-Divy.home=/tmp/.ivy2"
+      --master spark://spark:7077
+      --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.1,org.postgresql:postgresql:42.7.3
+      binance_trade_analytics.py
+
+  dashboard:
+    # 改用完整版 Python
+    image: python:3.11
+    container_name: btc-dashboard
+    depends_on:
+      - postgres
+    working_dir: /app
+    volumes:
+      - ./dashboard:/app
+    ports:
+      - "8501:8501"
+    command: >
+      sh -c "
+      pip install -r requirements.txt &&
+      streamlit run app.py --server.address 0.0.0.0
+      "
