@@ -34,6 +34,7 @@ services:
       - "5432:5432"
     volumes:
       - ./sql:/docker-entrypoint-initdb.d
+      - postgres_data:/var/lib/postgresql/data
 
   spark:
     image: apache/spark:3.5.1
@@ -44,7 +45,7 @@ services:
     environment:
       - SPARK_MODE=master
     command: /opt/spark/bin/spark-class org.apache.spark.deploy.master.Master
-  # --- 新增這個 Worker 服務 ---
+
   spark-worker:
     image: apache/spark:3.5.1
     container_name: spark-worker
@@ -53,11 +54,11 @@ services:
     environment:
       - SPARK_MODE=worker
       - SPARK_MASTER_URL=spark://spark:7077
-      - SPARK_WORKER_MEMORY=2G  # 根據你電腦記憶體大小調整
-      - SPARK_WORKER_CORES=2    # 根據你電腦 CPU 核心數調整
+      - SPARK_WORKER_MEMORY=4G
+      - SPARK_WORKER_CORES=4
     command: /opt/spark/bin/spark-class org.apache.spark.deploy.worker.Worker spark://spark:7077
+
   producer:
-    # 改用完整版 Python
     image: python:3.11
     container_name: btc-producer
     depends_on:
@@ -72,27 +73,59 @@ services:
       "
     restart: always
 
-  spark-job:
+  # 任務 A：即時清洗與入庫 (binance_trade_streaming.py)
+  spark-streaming:
     image: apache/spark:3.5.1
-    container_name: spark-streaming
+    container_name: spark-streaming-clean
     user: root
     depends_on:
       - kafka
       - postgres
       - spark
+      - spark-worker
     volumes:
       - ./spark:/opt/spark/work-dir
     working_dir: /opt/spark/work-dir
     command: >
+      sh -c "
+      pip install kafka-python websocket-client && 
       /opt/spark/bin/spark-submit
-      --conf "spark.driver.extraJavaOptions=-Divy.home=/tmp/.ivy2"
-      --conf "spark.executor.extraJavaOptions=-Divy.home=/tmp/.ivy2"
       --master spark://spark:7077
+      --total-executor-cores 2
+      --executor-memory 1G
+      --conf 'spark.driver.extraJavaOptions=-Divy.home=/tmp/.ivy2'
+      --conf 'spark.executor.extraJavaOptions=-Divy.home=/tmp/.ivy2'
+      --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.1,org.postgresql:postgresql:42.7.3
+      binance_trade_streaming.py
+      "
+
+  # 任務 B：K 線指標聚合分析 (binance_trade_analytics.py)
+  spark-analytics:
+    image: apache/spark:3.5.1
+    container_name: spark-streaming-analysis
+    user: root
+    depends_on:
+      - kafka
+      - postgres
+      - spark
+      - spark-worker
+    volumes:
+      - ./spark:/opt/spark/work-dir
+    working_dir: /opt/spark/work-dir
+    command: >
+      sh -c "
+      pip install kafka-python websocket-client && 
+      /opt/spark/bin/spark-submit
+      --master spark://spark:7077
+      --total-executor-cores 2
+      --executor-memory 1G
+      --conf 'spark.driver.extraJavaOptions=-Divy.home=/tmp/.ivy2'
+      --conf 'spark.executor.extraJavaOptions=-Divy.home=/tmp/.ivy2'
       --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.1,org.postgresql:postgresql:42.7.3
       binance_trade_analytics.py
+      "
 
   dashboard:
-    # 改用完整版 Python
     image: python:3.11
     container_name: btc-dashboard
     depends_on:
@@ -107,3 +140,6 @@ services:
       pip install -r requirements.txt &&
       streamlit run app.py --server.address 0.0.0.0
       "
+
+volumes:
+  postgres_data:
